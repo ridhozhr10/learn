@@ -10,28 +10,64 @@
 
 import { spawn } from "node:child_process"
 import { tmpdir } from "node:os"
-import { basename, dirname, join } from "node:path"
+import { basename, delimiter, dirname, join } from "node:path"
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 
-// rsvg-convert lives under MacPorts (/opt/local/bin); magick/gs under
-// /usr/local/bin; Homebrew under /opt/homebrew/bin. Augment PATH so the child
-// pi process (which may have inherited a thin PATH) still resolves them.
-export const EXTRA_PATH = ["/opt/local/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+// Extra dirs to PREPEND to PATH for child processes. On macOS these cover
+// MacPorts/Homebrew/usr-local, where rsvg-convert / magick may live. Windows
+// needs none: both render paths go through an installed Chromium-family
+// browser (see findBrowser below), so the list is empty there.
+export const EXTRA_PATH: string[] =
+  process.platform === "win32" ? [] : ["/opt/local/bin", "/usr/local/bin", "/opt/homebrew/bin"]
 
 // Transient session/preview files live under the OS temp dir (NOT the vault),
 // so only the PUBLISHED PNG ever lands inside the Obsidian vault (viz/).
 export const STAGING_ROOT = join(tmpdir(), "pi-visual-tools")
 export const FILES_DIRNAME = "viz"
 
-export const CHROME_CANDIDATES = [
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  "/Applications/Chromium.app/Contents/MacOS/Chromium",
-]
+/**
+ * Chromium-family browser used by BOTH render paths: mermaid-cli drives it via
+ * puppeteer, and the SVG path screenshots the SVG in it headlessly. Brave is
+ * preferred (this machine's Chromium); Chrome / Chromium / Edge are fallbacks
+ * so the extension still works on macOS or a stock Windows box.
+ *
+ * Override with the PI_BROWSER_PATH environment variable (takes precedence).
+ */
+export const BROWSER_CANDIDATES: string[] = (() => {
+  const pf = process.env["ProgramFiles"] ?? "C:\\Program Files"
+  const pf86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)"
+  const localAppData = process.env["LOCALAPPDATA"] ?? ""
+  const candidates = [
+    process.env.PI_BROWSER_PATH ?? "",
+    // Brave (preferred).
+    join(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+    join(pf86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+    localAppData ? join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe") : "",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/usr/bin/brave-browser",
+    "/usr/bin/brave",
+    // Chrome / Chromium fallbacks.
+    join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+    join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+    localAppData ? join(localAppData, "Google", "Chrome", "Application", "chrome.exe") : "",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    // Edge (present on every stock Windows install).
+    join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+    join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+  ].filter(Boolean)
+  return candidates
+})()
 
-export function findChrome(): string | undefined {
-  for (const c of CHROME_CANDIDATES) if (existsSync(c)) return c
+export function findBrowser(): string | undefined {
+  for (const c of BROWSER_CANDIDATES) if (c && existsSync(c)) return c
   return undefined
 }
+
+/** Kept as an alias so older call sites keep working. */
+export const findChrome = findBrowser
 
 export interface RunResult {
   code: number | null
@@ -46,7 +82,7 @@ export function run(
   opts: { cwd: string; timeoutMs: number; env?: Record<string, string> },
 ): Promise<RunResult> {
   return new Promise((resolveRun) => {
-    const augmentedPath = [...EXTRA_PATH, process.env.PATH ?? ""].join(":")
+    const augmentedPath = [...EXTRA_PATH, process.env.PATH ?? ""].filter(Boolean).join(delimiter)
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...(opts.env ?? {}), PATH: augmentedPath },

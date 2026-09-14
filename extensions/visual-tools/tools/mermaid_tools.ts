@@ -7,14 +7,15 @@
  *   render_mermaid  — render whatever is in the file → PNG, returned inline;
  *                     with `save_as`, also publish it into <cwd>/viz
  *
- * Bundled inside the visual-tools extension and exposed to subagents via the
- * interactive-subagents `registerToolExtension` hook (see ../index.ts). NOT a
- * global pi extension — loaded by the spawned child pi process for any subagent
- * whose `tools:` frontmatter includes these names (currently just
- * mermaid-maker). All three names map to this one file.
+ * Bundled inside the visual-tools extension and registered with pi directly —
+ * the child pi process the bundled `subagent` extension spawns loads this
+ * project extension, so any agent whose `tools:` frontmatter names these tools
+ * (currently just mermaid-maker) gets them. All three names map to this one
+ * file (see ../index.ts).
  *
  * Rendering shells out to the bundled @mermaid-js/mermaid-cli (`mmdc`) with a
- * puppeteer config pointing at an installed Chrome, so no Chromium download is
+ * puppeteer config pointing at an installed Chromium-family browser — Brave by
+ * preference (see ../../_common.ts `findBrowser`), so no Chromium download is
  * needed. Module-level session state persists across this child process's tool
  * calls and is naturally isolated from any parallel maker (different process).
  */
@@ -26,7 +27,7 @@ import {
   applyEdit,
   dirname,
   existsSync,
-  findChrome,
+  findBrowser,
   join,
   mkdirSync,
   publish,
@@ -40,7 +41,10 @@ import {
 
 const TOOL_DIR = dirname(fileURLToPath(import.meta.url))
 const EXTENSION_DIR = dirname(TOOL_DIR)
-const MMDC_BIN = join(EXTENSION_DIR, "node_modules", ".bin", "mmdc")
+// mmdc's real entry point. Spawning the JS directly (with the Node that is
+// running pi) works on every platform; resolving `node_modules/.bin/mmdc` on
+// Windows would instead need the `.cmd` shim plus a shell.
+const MMDC_JS = join(EXTENSION_DIR, "node_modules", "@mermaid-js", "mermaid-cli", "src", "cli.js")
 const GROUP = "mermaid"
 const BODY_FILE = "diagram.mmd"
 const RENDER_TIMEOUT_MS = 120_000
@@ -144,19 +148,22 @@ export default function mermaidToolsExtension(pi: ExtensionAPI) {
       const { workDir, bodyPath } = session
       mkdirSync(workDir, { recursive: true })
 
-      const chrome = findChrome()
+      const browser = findBrowser()
       const cfgPath = join(workDir, "puppeteer.json")
       writeFileSync(
         cfgPath,
-        JSON.stringify(chrome ? { executablePath: chrome, args: ["--no-sandbox"] } : { args: ["--no-sandbox"] }),
+        JSON.stringify({
+          ...(browser ? { executablePath: browser } : {}),
+          args: ["--no-sandbox", "--disable-gpu"],
+        }),
         "utf8",
       )
 
       const outPath = join(workDir, `render-${Date.now()}.png`)
       const res = await run(
-        MMDC_BIN,
-        ["-i", bodyPath, "-o", outPath, "-p", cfgPath, "-s", "2", "-b", "white"],
-        { cwd: workDir, timeoutMs: RENDER_TIMEOUT_MS, env: { PUPPETEER_SKIP_DOWNLOAD: "1" } },
+        process.execPath,
+        [MMDC_JS, "-i", bodyPath, "-o", outPath, "-p", cfgPath, "-s", "2", "-b", "white"],
+        { cwd: workDir, timeoutMs: RENDER_TIMEOUT_MS },
       )
 
       if (res.code !== 0 || !existsSync(outPath)) {

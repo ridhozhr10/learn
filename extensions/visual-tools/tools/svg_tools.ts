@@ -7,23 +7,27 @@
  *   render_svg  — render whatever is in the file → PNG, returned inline; with
  *                 `save_as`, also publish it into <cwd>/viz
  *
- * Bundled inside the visual-tools extension and exposed to subagents via the
- * interactive-subagents `registerToolExtension` hook (see ../index.ts). Loaded
- * by the spawned child pi process for any subagent whose `tools:` frontmatter
- * includes these names (currently just svg-maker). All three names map to this
- * one file.
+ * Bundled inside the visual-tools extension and registered with pi directly —
+ * the child pi process the bundled `subagent` extension spawns loads this
+ * project extension, so any agent whose `tools:` frontmatter names these tools
+ * (currently just svg-maker) gets them. All three names map to this one file
+ * (see ../index.ts).
  *
- * Rendering shells out to rsvg-convert (librsvg — good system-font handling),
- * falling back to ImageMagick's `magick` if rsvg-convert is absent. Both are
- * system binaries; no node render deps. Module-level session state persists
- * across this child process's tool calls, isolated from any parallel maker.
+ * Rendering tries rsvg-convert (librsvg), then ImageMagick's `magick`, then —
+ * the portable default, and the only one available on this Windows box —
+ * screenshots the SVG in a headless Chromium-family browser (Brave preferred;
+ * see ../_common.ts `findBrowser`). No node render deps. Module-level session
+ * state persists across this child process's tool calls, isolated from any
+ * parallel maker.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "@sinclair/typebox"
+import { pathToFileURL } from "node:url"
 import {
   applyEdit,
   existsSync,
+  findBrowser,
   join,
   mkdirSync,
   publish,
@@ -38,26 +42,99 @@ import {
 const GROUP = "svg"
 const BODY_FILE = "diagram.svg"
 const RENDER_TIMEOUT_MS = 60_000
+const SCALE = 2
 
 type RenderDetails = { ok: boolean; path: string; filename?: string }
 
 let session: Session | null = null
 
-/** Render an SVG file to PNG via rsvg-convert, falling back to magick. */
+/**
+ * Read the SVG's intrinsic pixel size so the screenshot viewport matches its
+ * aspect ratio (otherwise the browser letterboxes the picture). Percentage
+ * sizes are ignored in favour of the viewBox. Falls back to 800x600.
+ */
+function svgPixelSize(svg: string): { width: number; height: number } {
+  const attr = (name: string): number => {
+    const m = svg.match(new RegExp(`\\b${name}\\s*=\\s*["']?\\s*([0-9.]+)\\s*(px|pt|%)?`, "i"))
+    return m && m[2] !== "%" ? parseFloat(m[1]) : NaN
+  }
+  const vb = svg.match(/viewBox\s*=\s*["']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/i)
+  let width = attr("width")
+  let height = attr("height")
+  if (vb) {
+    if (!isFinite(width)) width = parseFloat(vb[1])
+    if (!isFinite(height)) height = parseFloat(vb[2])
+  }
+  if (!isFinite(width) || width <= 0) width = 800
+  if (!isFinite(height) || height <= 0) height = 600
+  return { width: Math.ceil(width), height: Math.ceil(height) }
+}
+
+/**
+ * Render an SVG by screenshotting it in a headless Chromium-family browser
+ * (Brave preferred). The SVG is inlined into a tiny HTML page and stretched to
+ * fill the viewport, which is set to the SVG's own aspect ratio times SCALE, so
+ * the result is a crisp, exact-size, white-background raster.
+ */
+async function renderSvgWithBrowser(svgPath: string, outPath: string, workDir: string) {
+  const browser = findBrowser()
+  if (!browser) {
+    return {
+      ok: false as const,
+      res: {
+        code: null,
+        stdout: "",
+        stderr: "No Chromium-family browser found. Install Brave, or set PI_BROWSER_PATH to one.",
+        timedOut: false,
+      },
+    }
+  }
+  const svg = readFileSync(svgPath, "utf8")
+  const { width, height } = svgPixelSize(svg)
+  const html =
+    `<!doctype html><html><head><meta charset="utf-8"><style>\n` +
+    `html,body{margin:0;padding:0;background:#fff}\n` +
+    `svg{display:block;width:100vw;height:100vh}\n` +
+    `</style></head><body>\n${svg}\n</body></html>`
+  const htmlPath = join(workDir, `svg-${Date.now()}.html`)
+  writeFileSync(htmlPath, html, "utf8")
+  const res = await run(
+    browser,
+    [
+      "--headless=new",
+      "--disable-gpu",
+      "--hide-scrollbars",
+      `--window-size=${width * SCALE},${height * SCALE}`,
+      `--screenshot=${outPath}`,
+      pathToFileURL(htmlPath).href,
+    ],
+    { cwd: workDir, timeoutMs: RENDER_TIMEOUT_MS },
+  )
+  if (res.code === 0 && existsSync(outPath)) return { ok: true as const, res }
+  return { ok: false as const, res }
+}
+
+/**
+ * Render an SVG file to PNG. Tries rsvg-convert, then ImageMagick, then the
+ * headless browser (the portable path used on Windows).
+ */
 async function renderSvg(svgPath: string, outPath: string, workDir: string) {
-  // rsvg-convert renders at the SVG's intrinsic size; -z 2 doubles it for crispness.
-  let res = await run("rsvg-convert", ["-z", "2", svgPath, "-o", outPath], {
+  // 1. rsvg-convert (librsvg — good system-font handling); -z SCALE for crispness.
+  const rsvgRes = await run("rsvg-convert", ["-z", String(SCALE), svgPath, "-o", outPath], {
     cwd: workDir,
     timeoutMs: RENDER_TIMEOUT_MS,
   })
-  if (res.code === 0 && existsSync(outPath)) return { ok: true as const, res }
-  // Fallback: ImageMagick. -density 192 (~2x of 96dpi) for a crisp raster.
+  if (rsvgRes.code === 0 && existsSync(outPath)) return { ok: true as const, res: rsvgRes }
+  // 2. ImageMagick — -density 192 (~2x of 96dpi) for a crisp raster.
   const magick = await run("magick", ["-density", "192", "-background", "white", svgPath, outPath], {
     cwd: workDir,
     timeoutMs: RENDER_TIMEOUT_MS,
   })
   if (magick.code === 0 && existsSync(outPath)) return { ok: true as const, res: magick }
-  return { ok: false as const, res: res.code !== null ? res : magick }
+  // 3. Headless browser (Brave/Chrome/Edge) — always available here.
+  const viaBrowser = await renderSvgWithBrowser(svgPath, outPath, workDir)
+  if (viaBrowser.ok) return viaBrowser
+  return { ok: false as const, res: viaBrowser.res.code !== null ? viaBrowser.res : rsvgRes }
 }
 
 export default function svgToolsExtension(pi: ExtensionAPI) {
@@ -161,7 +238,7 @@ export default function svgToolsExtension(pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: `${note}SVG render FAILED — no image produced (tried rsvg-convert then magick). Fix the source with edit_svg and call render_svg again.\n\nError:\n${detail}`,
+              text: `${note}SVG render FAILED — no image produced (tried rsvg-convert, magick, then a headless browser). Fix the source with edit_svg and call render_svg again.\n\nError:\n${detail}`,
             },
           ],
           details: { ok: false, path: "" } as RenderDetails,

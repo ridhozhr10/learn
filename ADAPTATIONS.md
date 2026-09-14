@@ -4,7 +4,7 @@ This clone of `ridhozhr10/learn` was adapted for this machine. Upstream targets 
 with an older pi and the `interactive-subagents` extension. Nothing else was touched.
 
 Environment: pi 0.85.1, Windows, provider `sumopod` (only provider registered), no tmux,
-no Chrome, no `rsvg-convert` / ImageMagick.
+no Chrome (Brave is installed and used for rendering), no `rsvg-convert` / ImageMagick.
 
 ## 1. Extensions — no changes needed
 
@@ -64,33 +64,70 @@ Writes `.pi/settings.json` → `{"packages": ["npm:pi-web-access"]}` and install
 It needs no API keys (zero-config Exa MCP, keyless DuckDuckGo fallback). Optional keys go in
 `~/.pi/agent/web-search.json`.
 
-## 5. Visuals — parked in `_disabled/`
+## 5. Visuals — re-enabled, rendering via Brave
 
-Moved out of the scanned dirs:
+Restored to the scanned dirs:
 
-- `_disabled/skills/visualize/`
-- `_disabled/agents/{mermaid-maker,svg-maker}.md`
-- `_disabled/extensions/visual-tools/`
+- `skills/visualize/`
+- `agents/{mermaid-maker,svg-maker}.md`
+- `extensions/visual-tools/`
 
-Two blockers, both upstream design decisions:
+Two upstream blockers were fixed:
 
-1. `extensions/visual-tools/index.ts` registers its six tools by calling
-   `globalThis.__pi_interactive_subagents.registerToolExtension(...)` and is a no-op without
-   that extension. pi's bundled subagent exposes no such hook, so the maker agents would spawn
-   with `--tools write_mermaid,edit_mermaid,render_mermaid` and die on unknown tools.
-2. Even with a working hook: `visual-tools/tools/_common.ts` lists only macOS Chrome paths in
-   `CHROME_CANDIDATES`, and `EXTRA_PATH` joins with `":"` (POSIX) — the SVG path also needs
-   `rsvg-convert` or `magick`, neither of which is installed.
+1. **Registration.** `extensions/visual-tools/index.ts` no longer talks to
+   `globalThis.__pi_interactive_subagents`; it registers the six tools with pi directly
+   (`mermaidTools(pi); svgTools(pi)`). pi's bundled `subagent` spawns an ordinary child `pi`
+   (no `--no-extensions`), which discovers and loads this project extension — so the
+   `--tools write_mermaid,edit_mermaid,render_mermaid,read` line in the maker frontmatter
+   resolves. Side effect: the six tools are also visible to the main session; harmless, since
+   the `visualize` skill still delegates to a maker.
+2. **Rendering on Windows.** `tools/_common.ts`:
+   - `EXTRA_PATH` is empty on win32 and PATH is joined with `path.delimiter` (was a hard-coded
+     POSIX `:` list of MacPorts/Homebrew dirs).
+   - `findChrome()` → `findBrowser()`: Brave first
+     (`C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe`, plus the
+     Program Files (x86) and `%LOCALAPPDATA%` variants), then Chrome / Chromium / Edge, then
+     the macOS paths. Override with `PI_BROWSER_PATH`.
 
-Re-enabling means restoring those files, adding a Windows Chrome/Edge path (and `;` PATH
-separator), installing `@mermaid-js/mermaid-cli` in `visual-tools/`, and either installing
-`interactive-subagents` or rewiring registration to pi's bundled subagent.
+   `tools/mermaid_tools.ts` spawns mmdc's real entry
+   (`node_modules/@mermaid-js/mermaid-cli/src/cli.js`) with `process.execPath` instead of the
+   POSIX `node_modules/.bin/mmdc` shim, and points puppeteer at the discovered browser.
+
+   `tools/svg_tools.ts` renders by screenshotting the SVG in the same headless browser — the
+   SVG is inlined into a tiny HTML page stretched to the viewport, and the viewport is set to
+   the SVG's own aspect ratio at 2x — falling back to `rsvg-convert` then `magick` if either is
+   present. No system tools needed on Windows.
+
+Dependencies (not committed; `node_modules/` is ignored):
+
+```bash
+cd .pi/extensions/visual-tools
+PUPPETEER_SKIP_DOWNLOAD=1 npm install --omit=dev --legacy-peer-deps
+```
+
+`puppeteer` is an explicit dependency (upstream only declares it as a peer of mermaid-cli) and
+is installed with its Chromium download disabled — Brave is used instead.
+
+Also fixed `package.json` (the upstream devDependency pointed at `/Users/amos/...`) and the
+maker frontmatter (dropped the upstream `model: anthropic/claude-sonnet-5` — there is no
+anthropic provider here, so the maker now inherits the dispatching model, which must be
+vision-capable so it can inspect its own renders; dropped `thinking`/`system-prompt`/`auto-exit`,
+which the bundled subagent ignores).
 
 ## Verified
 
 ```
+# research (unchanged)
 pi -p --approve --model sumopod/glm-5.1   # → skills: teach;  tools: read,bash,edit,write,
                                           #   ask_user_question,quiz,subagent,web_search,
                                           #   source_check,fetch_content,get_search_content
 pi -p "Call subagent(agent=\"researcher\", ...)"   # → researcher spawned, searched, returned
+
+# visuals re-enabled (child pi loads visual-tools; mmdc + Brave render)
+pi -p --approve --model sumopod/claude-haiku-4-5 \
+  "subagent(agent=\"mermaid-maker\", task=\"graph TD: packet → ordering/retransmit → reliable-stream\")"
+  # → viz/viz-packet-reliable-stream-*.png   754x556
+pi -p --approve --model sumopod/claude-haiku-4-5 \
+  "subagent(agent=\"svg-maker\", task=\"3-4-5 right triangle, label sides, mark right angle\")"
+  # → viz/viz-right-triangle-3-4-5-*.png     800x700
 ```
